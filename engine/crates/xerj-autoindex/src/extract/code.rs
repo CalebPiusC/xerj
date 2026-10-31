@@ -1453,6 +1453,31 @@ fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
             {
                 kind = "static";
             }
+            // Python: class-owned functions are `method`, while module-level
+            // functions and functions nested inside other functions stay
+            // `function`. The nearest enclosing definition scope decides — a
+            // `class_definition` makes it a method, an enclosing
+            // `function_definition` (nested helper) or nothing (module level)
+            // leaves it `function`. PYTHON_Q itself is unchanged: every
+            // definition is still captured exactly once, conditional
+            // definitions included, and only the emitted kind is relabeled.
+            if def.name == "python" && kind == "function" {
+                // `node` is the captured `identifier`; its parent is the
+                // `function_definition` itself, so start one level above and
+                // walk past decorators, `if` guards and suites alike.
+                let mut scope = node.parent().and_then(|n| n.parent());
+                while let Some(n) = scope {
+                    match n.kind() {
+                        "class_definition" => {
+                            kind = "method";
+                            break;
+                        }
+                        "function_definition" => break, // nested helper — stays `function`
+                        _ => {}
+                    }
+                    scope = n.parent();
+                }
+            }
             let name = text.get(node.byte_range()).unwrap_or("").trim();
             if name.is_empty() || name.len() > 200 {
                 continue;
@@ -3630,7 +3655,9 @@ export { type specTypeOnly as Alias, valueStore };
         );
         assert!(has(&s, "foo", "function"));
         assert!(has(&s, "Bar", "class"));
-        assert!(has(&s, "baz", "function"));
+        // `baz` is class-owned, so it is a `method`, not a `function`.
+        assert!(has(&s, "baz", "method"));
+        assert!(!has(&s, "baz", "function"));
     }
 
     /// #500: Python was the one major language whose extractor captured only
@@ -3667,6 +3694,179 @@ export { type specTypeOnly as Alias, valueStore };
         // Existing function/class capture is unchanged.
         assert!(has(&s, "f", "function"));
         assert!(has(&s, "C", "class"));
+    }
+
+    /// Class-owned function definitions are extracted as `method`, while
+    /// module-level functions stay `function` — instance methods and
+    /// `__init__` included. Each definition is captured exactly once: a
+    /// method is not also captured as a `function`.
+    #[test]
+    fn python_instance_methods_and_init() {
+        let s = syms(
+            "python",
+            "def top_level():\n    pass\n\nclass Account:\n    def __init__(self, owner):\n        self.owner = owner\n\n    def balance(self):\n        return self.owner\n",
+        );
+        assert!(has(&s, "top_level", "function"), "got {s:?}");
+        assert!(has(&s, "Account", "class"), "got {s:?}");
+        assert!(has(&s, "__init__", "method"), "got {s:?}");
+        assert!(has(&s, "balance", "method"), "got {s:?}");
+        assert!(!has(&s, "__init__", "function"), "got {s:?}");
+        assert!(!has(&s, "balance", "function"), "got {s:?}");
+        assert_eq!(
+            s.iter().filter(|x| x.kind == "method").count(),
+            2,
+            "got {s:?}"
+        );
+    }
+
+    /// Top-level `async def` stays `function`; `async def` inside a class is
+    /// `method`.
+    #[test]
+    fn python_async_methods_and_functions() {
+        let s = syms(
+            "python",
+            "async def top_level_async():\n    pass\n\nclass Server:\n    async def serve(self):\n        pass\n",
+        );
+        assert!(has(&s, "top_level_async", "function"), "got {s:?}");
+        assert!(has(&s, "serve", "method"), "got {s:?}");
+    }
+
+    /// Decorated methods are class-owned → `method`; the decorator is not
+    /// captured as a symbol, and a decorated module-level function stays
+    /// `function`.
+    #[test]
+    fn python_decorated_methods() {
+        let s = syms(
+            "python",
+            "def deco(f):\n    return f\n\n@deco\ndef module_func():\n    pass\n\nclass C:\n    @deco\n    def method(self):\n        pass\n",
+        );
+        assert!(has(&s, "deco", "function"), "got {s:?}");
+        assert!(has(&s, "module_func", "function"), "got {s:?}");
+        assert!(has(&s, "method", "method"), "got {s:?}");
+        assert!(!has(&s, "method", "function"), "got {s:?}");
+    }
+
+    /// `@classmethod`, `@staticmethod`, `@property` and `@<name>.setter`
+    /// bodies are all `def` statements inside the class body → `method`.
+    #[test]
+    fn python_classmethod_staticmethod_property() {
+        let s = syms(
+            "python",
+            "class C:\n    @classmethod\n    def cm(cls):\n        pass\n\n    @staticmethod\n    def sm():\n        pass\n\n    @property\n    def prop(self):\n        return 1\n\n    @prop.setter\n    def prop(self, value):\n        pass\n",
+        );
+        for name in ["cm", "sm", "prop"] {
+            assert!(has(&s, name, "method"), "got {s:?}");
+            assert!(!has(&s, name, "function"), "got {s:?}");
+        }
+        // The getter and setter are two distinct `def prop`s; both are `method`.
+        let props: Vec<_> = s.iter().filter(|x| x.name == "prop").collect();
+        assert_eq!(props.len(), 2, "got {s:?}");
+        assert!(props.iter().all(|x| x.kind == "method"), "got {s:?}");
+    }
+
+    /// Nested classes: a function defined in a nested class is still a method.
+    #[test]
+    fn python_nested_classes() {
+        let s = syms(
+            "python",
+            "class Outer:\n    class Inner:\n        def method(self):\n            pass\n",
+        );
+        assert!(has(&s, "Outer", "class"), "got {s:?}");
+        assert!(has(&s, "Inner", "class"), "got {s:?}");
+        assert!(has(&s, "method", "method"), "got {s:?}");
+    }
+
+    /// A class defined inside a function: `outer` stays `function`, `Inner`
+    /// is `class`, and `Inner`'s functions are still `method`.
+    #[test]
+    fn python_class_defined_inside_function() {
+        let s = syms(
+            "python",
+            "def outer():\n    class Inner:\n        def method(self):\n            pass\n    return Inner\n",
+        );
+        assert!(has(&s, "outer", "function"), "got {s:?}");
+        assert!(has(&s, "Inner", "class"), "got {s:?}");
+        assert!(has(&s, "method", "method"), "got {s:?}");
+    }
+
+    /// Conditional definitions: `PYTHON_Q` keeps capturing them, and the
+    /// nearest enclosing scope still decides the kind.
+    #[test]
+    fn python_conditional_definitions() {
+        let s = syms(
+            "python",
+            "if DEBUG:\n    def guarded():\n        pass\n\nclass C:\n    if FLAG:\n        def method(self):\n            pass\n",
+        );
+        assert!(has(&s, "guarded", "function"), "got {s:?}");
+        assert!(has(&s, "C", "class"), "got {s:?}");
+        assert!(has(&s, "method", "method"), "got {s:?}");
+    }
+
+    /// A nested helper inside a method stays `function` — its nearest
+    /// enclosing definition scope is the method, not the class.
+    #[test]
+    fn python_nested_helper_inside_method() {
+        let s = syms(
+            "python",
+            "class C:\n    def method(self):\n        def helper(x):\n            return x\n        return helper(self)\n",
+        );
+        assert!(has(&s, "method", "method"), "got {s:?}");
+        assert!(has(&s, "helper", "function"), "got {s:?}");
+        assert!(!has(&s, "helper", "method"), "got {s:?}");
+    }
+
+    /// Stub files (`.pyi`) share the python grammar, so the same rules apply:
+    /// class-owned signatures are `method`, module-level ones `function`.
+    #[test]
+    fn python_stub_file_symbols() {
+        let s = syms(
+            "python",
+            "from typing import Optional\n\nclass C:\n    def method(self) -> int: ...\n\n    def __init__(self) -> None: ...\n\ndef stub_func(x: str) -> Optional[str]: ...\n",
+        );
+        assert!(has(&s, "C", "class"), "got {s:?}");
+        assert!(has(&s, "method", "method"), "got {s:?}");
+        assert!(has(&s, "__init__", "method"), "got {s:?}");
+        assert!(has(&s, "stub_func", "function"), "got {s:?}");
+    }
+
+    /// Regression guard: every definition is captured exactly once, so no
+    /// symbol reaches `defs` under two kinds.
+    #[test]
+    fn python_each_definition_captured_once() {
+        let s = syms(
+            "python",
+            "class C:\n    def m(self):\n        pass\n\ndef f():\n    pass\n",
+        );
+        assert_eq!(s.len(), 3, "got {s:?}");
+        assert!(has(&s, "C", "class"), "got {s:?}");
+        assert!(has(&s, "m", "method"), "got {s:?}");
+        assert!(has(&s, "f", "function"), "got {s:?}");
+        let mut seen: std::collections::HashSet<(&str, &str)> =
+            std::collections::HashSet::new();
+        for sym in &s {
+            assert!(
+                seen.insert((sym.name.as_str(), sym.kind.as_str())),
+                "duplicate capture: {sym:?}"
+            );
+        }
+    }
+
+    /// `definitions()` reports the same symbol kinds: class-owned functions
+    /// come back as `method`, module-level ones as `function`.
+    #[test]
+    fn definitions_python_symbol_kinds() {
+        let src = "def top():\n    pass\n\nclass C:\n    def m(self):\n        pass\n";
+        let defs = definitions("mod.py", "python", src);
+        let top = defs
+            .iter()
+            .find(|d| d.symbol == "top")
+            .expect("top missing");
+        assert_eq!(top.kind, "function", "{defs:?}");
+        let m = defs.iter().find(|d| d.symbol == "m").expect("m missing");
+        assert_eq!(m.kind, "method", "{defs:?}");
+        let c = defs.iter().find(|d| d.symbol == "C").expect("C missing");
+        assert_eq!(c.kind, "class", "{defs:?}");
+        assert_eq!(top.file, "mod.py");
     }
 
     #[test]
