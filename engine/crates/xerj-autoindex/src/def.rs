@@ -761,6 +761,32 @@ mod tests {
         }
     }
 
+    /// `xerj def --kind` is a `term` on the stored symbol `kind`. Now that the
+    /// extractor labels Python class-owned `def`s as `method`, `--kind method`
+    /// selects a class method and `--kind function` cannot; a module-level
+    /// function is the reverse. Check both halves against the SAME records the
+    /// extractor actually produces, not hand-written kinds.
+    #[test]
+    fn kind_filter_distinguishes_python_methods_from_functions() {
+        let src = "def top():\n    pass\nclass C:\n    def run(self):\n        pass\n";
+        let defs = crate::extract::code::definitions("mod.py", "python", src);
+        let run = defs.iter().find(|d| d.symbol == "run").expect("run parsed");
+        let top = defs.iter().find(|d| d.symbol == "top").expect("top parsed");
+        assert_eq!(run.kind, "method");
+        assert_eq!(top.kind, "function");
+
+        // A `term` filter hits only when its value equals the stored kind.
+        let cases = [("method", true, false), ("function", false, true)];
+        for (arg, matches_run, matches_top) in cases {
+            let body = def_query("run", Some(arg), None, 5, None, None);
+            let filters = body.pointer("/query/bool/filter").unwrap().as_array().unwrap();
+            assert_eq!(filters.len(), 1, "{body}");
+            assert_eq!(filters[0], &json!({ "term": { "kind": arg } }), "{body}");
+            assert_eq!(run.kind == arg, matches_run, "run kind {}", run.kind);
+            assert_eq!(top.kind == arg, matches_top, "top kind {}", top.kind);
+        }
+    }
+
     /// `xerj def` prints with the same `hit_location` as search, so a PDF or
     /// notebook definition can cite `page` / `cell` only when the projection
     /// asks for them.

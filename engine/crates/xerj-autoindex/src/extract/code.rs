@@ -1392,6 +1392,45 @@ fn js_separate_value_exports<'a>(
     names
 }
 
+/// Python has no `method` capture: `PYTHON_Q` matches every `def` as
+/// `(function_definition name: (identifier) @function)`, so a class's methods
+/// used to be indistinguishable from module-level functions in `defs`,
+/// `symbols`, `definitions()` and a `xerj def --kind` filter.
+///
+/// A `def` is a method when the nearest enclosing DEFINITION above the one it
+/// names is a `class_definition`. Decorators (`decorated_definition`), class
+/// suites (`block`) and guards (`if`/`else`/`try`/`with`) are transparent, so a
+/// `def` written under a class-level conditional is still a method; an
+/// enclosing `function_definition` wins instead for a helper nested inside a
+/// method or inside any other function. Nothing above the `def` (module level,
+/// or a module-level conditional) leaves it a `function`.
+///
+/// `node` is the captured `identifier`. Relabelling the existing capture,
+/// rather than adding a `@method` query pattern, keeps exactly one capture per
+/// `def` — no duplicate symbol documents and no `code:<line>:<name>` collision.
+fn python_function_is_method(node: Node<'_>) -> bool {
+    // Skip the `function_definition` this identifier names. It is always the
+    // nearest ancestor of that kind for a PYTHON_Q `@function` capture; if a
+    // grammar change ever breaks that, fail open to `function` below.
+    let mut own = node.parent();
+    while let Some(n) = own {
+        if n.kind() == "function_definition" {
+            break;
+        }
+        own = n.parent();
+    }
+    let mut cur = own.and_then(|n| n.parent());
+    while let Some(n) = cur {
+        match n.kind() {
+            "class_definition" => return true,
+            "function_definition" => return false,
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    false
+}
+
 fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
     let mut parser = Parser::new();
     parser.set_language(&def.language).ok()?;
@@ -1452,6 +1491,14 @@ fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
                 && !cpp_declarator_is_const_qualified(node, text.as_bytes())
             {
                 kind = "static";
+            }
+            // Python: PYTHON_Q captures every `def` as `@function`. Relabel
+            // the class-owned ones to `method` so `defs`, `symbols`,
+            // `definitions()` and `--kind method` can tell them apart from
+            // ordinary functions. Python-only and only for that capture, so
+            // `class`/`const` and every other grammar are untouched.
+            if def.name == "python" && kind == "function" && python_function_is_method(node) {
+                kind = "method";
             }
             let name = text.get(node.byte_range()).unwrap_or("").trim();
             if name.is_empty() || name.len() > 200 {
@@ -3630,7 +3677,271 @@ export { type specTypeOnly as Alias, valueStore };
         );
         assert!(has(&s, "foo", "function"));
         assert!(has(&s, "Bar", "class"));
-        assert!(has(&s, "baz", "function"));
+        // A `def` owned by a class is a method, not a function.
+        assert!(has(&s, "baz", "method"));
+        assert!(!has(&s, "baz", "function"));
+    }
+
+    /// Regression: PYTHON_Q's single `(function_definition name: (identifier)
+    /// @function)` pattern captures EVERY `def`, including class-owned ones, so
+    /// `defs`/`symbols` used to read `function balance` with no way to tell a
+    /// method from a module-level function. This is the test that fails before
+    /// the scope relabel and passes after it.
+    #[test]
+    fn python_class_owned_functions_are_methods() {
+        let s = syms(
+            "python",
+            r#"def top_level(x):
+    return x
+
+class Account:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def balance(self):
+        return 0
+"#,
+        );
+        assert!(has(&s, "top_level", "function"), "got {s:?}");
+        assert!(!has(&s, "top_level", "method"), "got {s:?}");
+        assert!(has(&s, "Account", "class"), "got {s:?}");
+        assert!(has(&s, "__init__", "method"), "got {s:?}");
+        assert!(has(&s, "balance", "method"), "got {s:?}");
+        assert!(!has(&s, "balance", "function"), "got {s:?}");
+    }
+
+    /// `async def`, decorators, and the descriptor decorators
+    /// (`staticmethod`/`classmethod`/`property`/setter) all stay
+    /// `function_definition` nodes in tree-sitter-python, wrapped in a
+    /// `decorated_definition`. Every one owned by a class must be a method,
+    /// while a top-level `async def` stays a function.
+    #[test]
+    fn python_async_decorated_and_descriptor_methods_are_methods() {
+        let s = syms(
+            "python",
+            r#"async def top_async():
+    pass
+
+class Service:
+    async def fetch(self):
+        pass
+
+    @staticmethod
+    def make():
+        return Service()
+
+    @classmethod
+    def from_config(cls, cfg):
+        return cls()
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        self._name = value
+
+    @decorator(arg=1)
+    def decorated(self):
+        pass
+"#,
+        );
+        assert!(has(&s, "top_async", "function"), "got {s:?}");
+        assert!(!has(&s, "top_async", "method"), "got {s:?}");
+        for m in ["fetch", "make", "from_config", "name", "decorated"] {
+            assert!(has(&s, m, "method"), "{m}: got {s:?}");
+            assert!(!has(&s, m, "function"), "{m}: got {s:?}");
+        }
+        // The property getter and setter are two separate `def`s at two
+        // different lines: both methods, and no capture is duplicated.
+        let names: Vec<&Symbol> = s.iter().filter(|x| x.name == "name").collect();
+        assert_eq!(names.len(), 2, "got {s:?}");
+        let mut lines: Vec<usize> = names.iter().map(|x| x.line).collect();
+        lines.sort_unstable();
+        lines.dedup();
+        assert_eq!(lines.len(), 2, "getter and setter keep their own lines: {s:?}");
+    }
+
+    /// The nearest ENCLOSING definition decides, not "is there a class
+    /// anywhere above this def". Nested classes, classes declared inside a
+    /// function, helpers nested in a method, and `def`s under class-level or
+    /// module-level conditionals all have to land on the right side.
+    #[test]
+    fn python_nesting_and_conditional_scopes_classify_by_nearest_definition() {
+        let s = syms(
+            "python",
+            r#"def outer():
+    def local_helper():
+        pass
+    class Local:
+        def local_method(self):
+            pass
+    return local_helper
+
+class Outer:
+    class Inner:
+        def inner_method(self):
+            pass
+
+    def method(self):
+        def helper_inside_method():
+            pass
+        return helper_inside_method
+
+    if FLAG:
+        def conditional_method(self):
+            pass
+    else:
+        def other_conditional_method(self):
+            pass
+
+if FLAG:
+    def module_conditional():
+        pass
+"#,
+        );
+        for f in [
+            "outer",
+            "local_helper",
+            "helper_inside_method",
+            "module_conditional",
+        ] {
+            assert!(has(&s, f, "function"), "{f}: got {s:?}");
+            assert!(!has(&s, f, "method"), "{f}: got {s:?}");
+        }
+        for m in [
+            "local_method",
+            "inner_method",
+            "method",
+            "conditional_method",
+            "other_conditional_method",
+        ] {
+            assert!(has(&s, m, "method"), "{m}: got {s:?}");
+            assert!(!has(&s, m, "function"), "{m}: got {s:?}");
+        }
+        assert!(has(&s, "Local", "class"), "got {s:?}");
+        assert!(has(&s, "Outer", "class"), "got {s:?}");
+        assert!(has(&s, "Inner", "class"), "got {s:?}");
+    }
+
+    /// A stub is parsed by the same python registry row (`pyi` is one of its
+    /// extensions) and has the same `def`/`class` shapes, so its methods must
+    /// be `method` too — `xerj def` resolves names that exist only in a stub.
+    #[test]
+    fn python_stub_files_classify_methods_consistently() {
+        let stub = r#"class Repo:
+    def load(self, key: str) -> str: ...
+    async def aload(self) -> None: ...
+
+def module_helper() -> int: ...
+"#;
+        let s = syms("python", stub);
+        assert!(has(&s, "Repo", "class"), "got {s:?}");
+        assert!(has(&s, "load", "method"), "got {s:?}");
+        assert!(has(&s, "aload", "method"), "got {s:?}");
+        assert!(has(&s, "module_helper", "function"), "got {s:?}");
+        assert!(!has(&s, "load", "function"), "got {s:?}");
+
+        // Through the real extractor: a `.pyi` file emits one `method` record
+        // for `load`, never a `function` record for it.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("repo.pyi");
+        std::fs::write(&f, stub).unwrap();
+        let sn = crate::sniff::sniff_with_name(&f, Path::new("repo.pyi")).unwrap();
+        let mut records: Vec<RawRecord> = Vec::new();
+        extract(&f, &sn, &mut |record| {
+            records.push(record);
+            true
+        })
+        .unwrap();
+        let kinds: Vec<&str> = records
+            .iter()
+            .filter(|r| r.fields.get("name").and_then(Value::as_str) == Some("load"))
+            .filter_map(|r| r.fields.get("kind").and_then(Value::as_str))
+            .collect();
+        assert_eq!(kinds, vec!["method"], "got {records:?}");
+    }
+
+    /// Relabelling the existing capture (rather than adding a `@method`
+    /// pattern) must leave exactly one symbol per `def`, one record per
+    /// `code:<line>:<name>` locator, and a `defs` list that says `method`.
+    #[test]
+    fn python_method_relabel_does_not_duplicate_or_mislabel_symbols() {
+        let src = r#"def top():
+    pass
+
+class C:
+    def run(self):
+        pass
+"#;
+        let s = syms("python", src);
+        assert_eq!(s.iter().filter(|x| x.name == "run").count(), 1, "got {s:?}");
+        assert_eq!(s.len(), 3, "one function, one class, one method: got {s:?}");
+        let mut fields = Map::new();
+        insert_symbol_catalog(&mut fields, &s);
+        let defs = fields["defs"].as_str().unwrap_or("");
+        assert!(defs.contains("method run"), "got {defs:?}");
+        assert!(defs.contains("function top"), "got {defs:?}");
+        assert!(!defs.contains("function run"), "got {defs:?}");
+        let symbols = fields["symbols"].as_array().unwrap();
+        assert_eq!(symbols.len(), 3, "got {symbols:?}");
+        assert!(symbols
+            .iter()
+            .any(|v| v["name"] == "run" && v["kind"] == "method"));
+
+        // The `xerj def --kind` filter is a `term` on this stored `kind`:
+        // `method` matches `run`, `function` does not; `top` is the reverse.
+        let mut records = Vec::new();
+        let mut stats = ExtractStats::default();
+        assert!(emit_code_doc(
+            Path::new("mod.py"),
+            "python",
+            src,
+            &s,
+            &mut stats,
+            &mut |record| {
+                records.push(record);
+                true
+            },
+        ));
+        let kind_of = |name: &str| -> Vec<&str> {
+            records
+                .iter()
+                .filter(|r| r.fields.get("name").and_then(Value::as_str) == Some(name))
+                .filter_map(|r| r.fields.get("kind").and_then(Value::as_str))
+                .collect()
+        };
+        assert_eq!(kind_of("run"), vec!["method"], "got {records:?}");
+        assert_eq!(kind_of("top"), vec!["function"], "got {records:?}");
+        assert_eq!(stats.records as usize, records.len(), "got {records:?}");
+        assert_eq!(records.len(), 4, "one file doc + three symbol docs: got {records:?}");
+    }
+
+    /// `definitions()` feeds the hub pack's defs index; it copies `kind`
+    /// straight from the parsed `Symbol`, so it must observe the relabel too.
+    #[test]
+    fn definitions_reports_python_methods_as_method() {
+        let defs = definitions(
+            "pkg/mod.py",
+            "python",
+            r#"def helper():
+    pass
+class C:
+    def run(self):
+        pass
+"#,
+        );
+        let kind = |name: &str| {
+            defs.iter()
+                .find(|d| d.symbol == name)
+                .map(|d| d.kind.as_str())
+        };
+        assert_eq!(kind("helper"), Some("function"), "got {defs:?}");
+        assert_eq!(kind("C"), Some("class"), "got {defs:?}");
+        assert_eq!(kind("run"), Some("method"), "got {defs:?}");
+        // Relabelling must not make a non-constant look value-bearing.
+        assert!(defs.iter().all(|d| d.value.is_none()), "got {defs:?}");
     }
 
     /// #500: Python was the one major language whose extractor captured only
